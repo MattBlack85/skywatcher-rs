@@ -14,15 +14,15 @@ use tonic::{transport::Server, Request, Response, Status};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-mod device;
-use device::{look_for_devices, MountDevice};
+mod synscan;
+use synscan::{look_for_devices, MountDevice};
 
 #[derive(Default, Clone)]
-struct EQmodDriver {
+struct SynScanDriver {
     devices: Vec<Arc<RwLock<MountDevice>>>,
 }
 
-impl EQmodDriver {
+impl SynScanDriver {
     fn new() -> Self {
         let found = look_for_devices();
         let mut devices: Vec<Arc<RwLock<MountDevice>>> = Vec::new();
@@ -34,7 +34,7 @@ impl EQmodDriver {
             if let Some(serial) = dev.1.serial_number {
                 device_name = device_name + "-" + &serial
             }
-            if let Some(device) = MountDevice::new(&device_name, &dev.0, 115200, 5000) {
+            if let Some(device) = MountDevice::new(&device_name, &dev.0, 9600, 5000) {
                 devices.push(Arc::new(RwLock::new(device)));
             } else {
                 error!("Cannot start communication with {}", &device_name);
@@ -45,7 +45,7 @@ impl EQmodDriver {
 }
 
 #[tonic::async_trait]
-impl AstroService for EQmodDriver {
+impl AstroService for SynScanDriver {
     async fn expose(
         &self,
         request: Request<CcdExposureRequest>,
@@ -143,7 +143,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let host = "127.0.0.1";
     let addr = build_server_address(host);
-    let driver = EQmodDriver::new();
+    let driver = SynScanDriver::new();
 
     let mut devices_for_fetching = Vec::new();
     let mut devices_for_closing = Vec::new();
@@ -162,7 +162,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    info!("EQMOD driver process listening on {}", addr);
+    info!("SynScan driver process listening on {}", addr);
     Server::builder()
         .add_service(reflection_service)
         .add_service(AstroServiceServer::new(driver))
