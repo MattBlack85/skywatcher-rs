@@ -1,0 +1,32 @@
+[package]
+name = "skywatcher-rs"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+hex = "0.4"
+serialport = "4.1"
+log = "0.4"
+env_logger = "0.9"
+lightspeed-astro = "0.8"
+astrotools = "0.4"
+tonic = "0.7"
+tonic-reflection = "0.4"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+tokio-serial = "5.4"
+
+[dependencies.uuid]
+version = "1"
+features = [
+    "v4",
+    "fast-rng",
+]
+
+[dev-dependencies]
+criterion = { version = "0.3", features = ["html_reports"] }
+
+[[bench]]
+name = "reverse_benchmark"
+harness = false
