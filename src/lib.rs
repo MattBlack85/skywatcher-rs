@@ -43,8 +43,15 @@ pub fn precise_revolutions_to_degrees(rev: u32) -> f32 {
     rev as f32 / 16_777_216 as f32 * 360 as f32
 }
 
-pub fn degrees_to_precise_revolutions(deg: f32) -> i32 {
-    ((deg / 360 as f32) * 16_777_216 as f32) as i32
+pub fn degrees_to_precise_revolutions(deg: f64) -> i32 {
+    ((deg / 360.0) * 16_777_216_f64) as i32
+}
+
+pub enum TrackingMode {
+    Off = 0,
+    AltAz = 1,
+    Eq = 2,
+    Pec = 3,
 }
 
 #[cfg(test)]

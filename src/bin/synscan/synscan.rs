@@ -1,6 +1,7 @@
 use astrotools::AstroSerialDevice;
 use hex::FromHex;
 use lightspeed_astro::devices::actions::DeviceActions;
+use lightspeed_astro::props::Permission;
 use lightspeed_astro::props::Property;
 use log::{debug, error, info, warn};
 #[cfg(windows)]
@@ -8,12 +9,21 @@ use serialport::COMPort;
 #[cfg(unix)]
 use serialport::TTYPort;
 use serialport::{available_ports, SerialPortType, UsbPortInfo};
-use skywatcher_rs::str_24bits_to_u32;
-use skywatcher_rs::{degrees_to_precise_revolutions, degrees_to_revolutions};
+use skywatcher_rs::{
+    degrees_to_precise_revolutions, degrees_to_revolutions, str_24bits_to_u32, TrackingMode,
+};
 use std::fmt::UpperHex;
 use std::io::{Read, Write};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
+use universe::transform::{dec_to_deg, ra_to_deg};
+use universe::{Declination, RightAscension};
 use uuid::Uuid;
+
+const TRACKING_OFF: &str = "Off";
+const TRACKING_ALT_AZ: &str = "AltAz";
+const TRACKING_EQUATORIAL: &str = "Equatorial";
+const TRACKING_PEC: &str = "PEC";
 
 enum Command {
     Echo = 0x4b,
@@ -25,18 +35,44 @@ enum Command {
     GoToPreciseRaDec = 0x72,
     GoToAltAz = 0x42,
     GoToPreciseAltAz = 0x62,
+    GetTrackingMode = 0x74,
+    SetTrackingMode = 0x54,
+    GetVersion = 0x56,
+    GetModel = 0x6d,
+    GetAlignment = 0x4a,
+}
+
+pub struct CustomProp {
+    name: String,
+    value: Arc<RwLock<String>>,
+    kind: String,
+    permission: Permission,
+}
+
+impl CustomProp {
+    fn to_ls_prop(&self) -> Property {
+        Property {
+            name: self.name.to_string(),
+            value: self.value.read().unwrap().to_string(),
+            kind: self.kind.to_string(),
+            permission: self.permission as i32,
+        }
+    }
 }
 
 pub struct MountDevice {
     id: Uuid,
     name: String,
-    pub properties: Vec<Property>,
+    properties: Vec<CustomProp>,
+    static_properties: Vec<Property>,
     address: String,
     pub baud: u32,
     #[cfg(unix)]
     pub port: TTYPort,
     #[cfg(windows)]
     pub port: COMPort,
+    track_mode: Arc<RwLock<String>>,
+    aligned: Arc<RwLock<String>>,
 }
 
 impl AstroSerialDevice for MountDevice {
@@ -48,9 +84,12 @@ impl AstroSerialDevice for MountDevice {
                 id: Uuid::new_v4(),
                 name: name.to_owned(),
                 properties: Vec::new(),
+                static_properties: Vec::new(),
                 address: address.to_owned(),
                 baud,
                 port: port_,
+                track_mode: Arc::new(RwLock::new(String::from("Off"))),
+                aligned: Arc::new(RwLock::new(String::from("false"))),
             };
 
             if let Err(e) = dev.send_command(Command::Echo as i32, Some("x".to_string())) {
@@ -68,7 +107,8 @@ impl AstroSerialDevice for MountDevice {
     }
 
     fn fetch_props(&mut self) {
-        info!("Fetching props");
+        info!("Fetching actual state");
+        self.get_tracking_mode();
     }
 
     fn get_id(&self) -> Uuid {
@@ -84,7 +124,7 @@ impl AstroSerialDevice for MountDevice {
     }
 
     fn get_properties(&self) -> &Vec<Property> {
-        &self.properties
+        todo!()
     }
 
     fn send_command<T>(&mut self, comm: T, val: Option<String>) -> Result<String, DeviceActions>
@@ -100,6 +140,7 @@ impl AstroSerialDevice for MountDevice {
         debug!("Hex command: {:?}", &hex_command);
         // Cast the hex string to a sequence of bytes
         let command: Vec<u8> = Vec::from_hex(hex_command).expect("Invalid Hex String");
+        debug!("Sent RAW command: {:?}", &command);
 
         match self.port.write(&command) {
             Ok(_) => {
@@ -127,11 +168,11 @@ impl AstroSerialDevice for MountDevice {
                         Err(e) => error!("Unknown error occurred {:?}", e),
                     }
                 }
-
+                debug!("RAW RESPONSE: {:?}", &final_buf);
                 // Use this to check if the response is OK (=) or there is an error (!)
-                let response = std::str::from_utf8(&final_buf).unwrap();
+                let response = String::from_utf8(final_buf).unwrap();
                 debug!("RESPONSE: {}", response);
-                Ok(response.to_owned())
+                Ok(response)
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => Err(DeviceActions::Timeout),
             Err(e) => {
@@ -141,19 +182,44 @@ impl AstroSerialDevice for MountDevice {
         }
     }
 
-    fn update_property(&mut self, _: &str, _: &str) -> Result<(), DeviceActions> {
-        todo!()
+    fn update_property(&mut self, name: &str, value: &str) -> Result<(), DeviceActions> {
+        info!("Synscan updating property {} with {}", name, value);
+        if let Some(prop_idx) = self.find_property_index(name) {
+            let r_prop = self.properties.get(prop_idx).unwrap();
+
+            match r_prop.permission {
+                Permission::ReadOnly => Err(DeviceActions::CannotUpdateReadOnlyProperty),
+                _ => self.update_property_remote(name, value),
+            }
+        } else {
+            Err(DeviceActions::UnknownProperty)
+        }
     }
 
-    fn update_property_remote(&mut self, _: &str, _: &str) -> Result<(), DeviceActions> {
-        todo!()
+    fn update_property_remote(&mut self, name: &str, value: &str) -> Result<(), DeviceActions> {
+        match name {
+            "TRACKING_MODE" => self.set_tracking_mode(value),
+            _ => Err(DeviceActions::UnknownProperty),
+        }
     }
-    fn find_property_index(&self, _: &str) -> Option<usize> {
-        todo!()
+    fn find_property_index(&self, name: &str) -> Option<usize> {
+        let mut index = 256;
+
+        for (idx, prop) in self.properties.iter().enumerate() {
+            if prop.name == name {
+                index = idx;
+                break;
+            }
+        }
+        if index == 256 {
+            None
+        } else {
+            Some(index)
+        }
     }
 }
 
-trait SynScanMount {
+pub trait SynScanMount {
     fn init_device(&mut self);
     fn echo(&mut self, val: String);
     fn get_ra_dec_position(&mut self) -> String;
@@ -161,19 +227,46 @@ trait SynScanMount {
     fn get_alt_az_position(&mut self) -> String;
     fn get_precise_alt_az_position(&mut self) -> String;
     fn goto_ra_dec(&mut self, ra_degrees: f32, dec_degrees: f32);
-    fn goto_precise_ra_dec(&mut self, ra_degrees: f32, dec_degrees: f32);
+    fn goto_precise_ra_dec(&mut self, ra_degrees: f64, dec_degrees: f64);
     fn goto_alt_az(&mut self, degrees: f32);
     fn goto_precise_alt_az(&mut self, degrees: f32);
+    fn get_tracking_mode(&mut self);
+    fn set_tracking_mode(&mut self, mode: &str) -> Result<(), DeviceActions>;
+    fn init_props(&mut self);
+    fn get_ls_props(&self) -> Vec<Property>;
+    fn get_version(&mut self) -> String;
+    fn get_model(&mut self) -> String;
+    fn is_aligned(&mut self);
 }
 
 impl SynScanMount for MountDevice {
+    fn get_ls_props(&self) -> Vec<Property> {
+        let mut ls_props = Vec::with_capacity(self.properties.len() + self.static_properties.len());
+        for p in &self.properties {
+            info!("Transforming into LS PROP: {}", p.name);
+            ls_props.push(p.to_ls_prop());
+        }
+        for p in &self.static_properties {
+            ls_props.push(p.clone());
+        }
+
+        ls_props
+    }
     fn init_device(&mut self) {
         self.get_ra_dec_position();
         self.get_precise_ra_dec_position();
         self.get_alt_az_position();
         self.get_precise_alt_az_position();
-        //self.goto_precise_ra_dec(26.251938, 90.00011);
-        self.goto_precise_ra_dec(0.0000, 90.00011);
+        self.get_version();
+        self.init_props();
+        // let ra = RightAscension::new(17, 41, 56.35);
+        // let dec = Declination::new(72, 8, 55.86);
+        // let ra_deg = ra_to_deg(&ra);
+        // let dec_deg = dec_to_deg(&dec);
+
+        // info!("RA degrees: {} DEC degrees: {}", ra_deg, dec_deg);
+
+        // self.goto_precise_ra_dec(ra_deg, dec_deg);
     }
 
     /// Useful for debugging or to check communication
@@ -227,7 +320,7 @@ impl SynScanMount for MountDevice {
         debug!("GOTO payload: {}", &payload);
         self.send_command(Command::GoToRaDec as i32, Some(payload));
     }
-    fn goto_precise_ra_dec(&mut self, ra_degrees: f32, dec_degrees: f32) {
+    fn goto_precise_ra_dec(&mut self, ra_degrees: f64, dec_degrees: f64) {
         let dec_revolutions = degrees_to_precise_revolutions(dec_degrees);
         let ra_revolutions = degrees_to_precise_revolutions(ra_degrees);
         debug!("DEC rev calculated: {}", dec_revolutions);
@@ -244,6 +337,177 @@ impl SynScanMount for MountDevice {
 
     fn goto_alt_az(&mut self, degrees: f32) {}
     fn goto_precise_alt_az(&mut self, degrees: f32) {}
+
+    fn get_tracking_mode(&mut self) {
+        let new_tm = match self.send_command(Command::GetTrackingMode as i32, None) {
+            Ok(t) => match t.as_str() {
+                "\0#" => TRACKING_OFF.to_string(),
+                "\u{1}#" => TRACKING_ALT_AZ.to_string(),
+                "\u{2}#" => TRACKING_EQUATORIAL.to_string(),
+                "\u{3}#" => TRACKING_PEC.to_string(),
+                _ => String::from("UNKNOWN"),
+            },
+            Err(_) => {
+                error!("Couldn't read actual tracking mode of the mount");
+                String::from("-1")
+            }
+        };
+
+        let mut tm = self.track_mode.write().unwrap();
+
+        if tm.to_string() != new_tm {
+            info!("GET => Updating track mode");
+            tm.clear();
+            tm.push_str(&new_tm.to_owned());
+            info!("GET => Updating track mode");
+        }
+    }
+
+    fn set_tracking_mode(&mut self, mode: &str) -> Result<(), DeviceActions> {
+        let mode_code = match mode {
+            "Off" => "\0",
+            "AltAz" => "\u{1}",
+            "Equatorial" => "\u{2}",
+            "PEC" => "\u{3}",
+            _ => {
+                error!("Tracking mode: {} not supported", mode);
+                "UNKNOWN"
+            }
+        };
+        warn!("CODE: {:?}", mode_code.as_bytes());
+
+        if mode_code == "UNKNOWN" {
+            return Err(DeviceActions::InvalidValue);
+        }
+
+        let old_tm = self.track_mode.read().unwrap().to_string().clone();
+
+        if mode != old_tm {
+            info!("SET => Updating track mode");
+            match self.send_command(Command::SetTrackingMode as i32, Some(mode_code.to_string())) {
+                Ok(_) => {
+                    info!("SET => Updated value track mode");
+                    {
+                        let mut tm = self.track_mode.write().unwrap();
+                        tm.clear();
+                        tm.push_str(&mode.to_owned());
+                    }
+                    return Ok(());
+                }
+                Err(e) => {
+                    info!("SET => Not updated value track mode, COM error");
+                    return Err(e);
+                }
+            }
+        }
+        info!("SET => Not updated track mode, same value");
+        Ok(())
+    }
+
+    fn get_version(&mut self) -> String {
+        let version = match self.send_command(Command::GetVersion as i32, None) {
+            Ok(v) => v,
+            Err(e) => {
+                error!(
+                    "Could not read the version from the hand controller: {:?}",
+                    e
+                );
+                "000000".to_string()
+            }
+        };
+        debug!("raw version: {}", version);
+        let major = u8::from_str_radix(&version[0..2], 16).unwrap();
+        let minor = u8::from_str_radix(&version[2..4], 16).unwrap();
+        let patch = u8::from_str_radix(&version[4..6], 16).unwrap();
+        format!("{}.{}.{}", major, minor, patch)
+    }
+
+    fn get_model(&mut self) -> String {
+        let raw_model = match self.send_command(Command::GetModel as i32, None) {
+            Ok(m) => {
+                info!("Model: {:?}", &m.as_bytes());
+                m
+            }
+            Err(e) => {
+                error!("Could not read the mount model: {:?}", e);
+                "UNKNOWN".to_string()
+            }
+        };
+
+        match u8::from_str_radix(&raw_model[0..1], 16).unwrap() {
+            0 => String::from("EQ6"),
+            1 => String::from("HEQ5"),
+            2 => String::from("EQ5"),
+            3 => String::from("EQ3"),
+            4 => String::from("EQ8"),
+            5 => String::from("AZ-EQ6"),
+            6 => String::from("AZ-EQ5"),
+            128..=143 => String::from("AZ"),
+            144..=159 => String::from("DOB"),
+            _ => String::from("AllView"),
+        }
+    }
+
+    fn is_aligned(&mut self) {
+        let raw_value = match self.send_command(Command::GetAlignment as i32, None) {
+            Ok(m) => {
+                info!("Aligned: {:?}", &m);
+                m
+            }
+            Err(e) => {
+                error!("Could not read the mount alignment: {:?}", e);
+                "UNKNOWN".to_string()
+            }
+        };
+
+        let status = match &raw_value.chars().next() {
+            Some(v) => match *v as i32 {
+                1 => "true",
+                _ => "false",
+            },
+            _ => {
+                error!("Cannot read alignment value");
+                "false"
+            }
+        };
+
+        let aligned = self.aligned.read().unwrap().clone();
+
+        if status != aligned.to_string() {
+            {
+                let mut a = self.aligned.write().unwrap();
+                a.clear();
+                a.push_str(&status);
+            }
+        }
+    }
+
+    fn init_props(&mut self) {
+        let version = self.get_version();
+        //self.name = self.get_model() + &self.name;
+        self.is_aligned();
+        // Build the version prop, always immutable
+        self.static_properties.push(Property {
+            name: String::from("SYNSCAN_VERSION"),
+            kind: String::from("string"),
+            value: version,
+            permission: Permission::ReadOnly as i32,
+        });
+
+        self.properties.push(CustomProp {
+            name: String::from("TRACKING_MODE"),
+            kind: String::from("integer"),
+            permission: Permission::ReadWrite,
+            value: self.track_mode.clone(),
+        });
+
+        self.properties.push(CustomProp {
+            name: String::from("ALIGNED"),
+            kind: String::from("boolean"),
+            permission: Permission::ReadOnly,
+            value: self.aligned.clone(),
+        })
+    }
 }
 
 pub fn look_for_devices() -> Vec<(String, UsbPortInfo)> {

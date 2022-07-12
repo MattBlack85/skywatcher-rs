@@ -12,10 +12,10 @@ use log::{debug, error, info};
 use tonic::{transport::Server, Request, Response, Status};
 
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 mod synscan;
-use synscan::{look_for_devices, MountDevice};
+use synscan::{look_for_devices, MountDevice, SynScanMount};
 
 #[derive(Default, Clone)]
 struct SynScanDriver {
@@ -27,9 +27,7 @@ impl SynScanDriver {
         let found = look_for_devices();
         let mut devices: Vec<Arc<RwLock<MountDevice>>> = Vec::new();
         for dev in found {
-            let mut device_name = String::from("EQ6-r");
-            debug!("name: {}", dev.0);
-            debug!("info: {:?}", dev.1);
+            let mut device_name = String::from("");
 
             if let Some(serial) = dev.1.serial_number {
                 device_name = device_name + "-" + &serial
@@ -58,6 +56,7 @@ impl AstroService for SynScanDriver {
         &self,
         request: Request<GetDevicesRequest>,
     ) -> Result<Response<GetDevicesResponse>, Status> {
+        let now = Instant::now();
         debug!(
             "Got a request to query devices from {:?}",
             request.remote_addr()
@@ -73,12 +72,16 @@ impl AstroService for SynScanDriver {
                 let d = ProtoDevice {
                     id: device.get_id().to_string(),
                     name: device.get_name().to_owned(),
-                    family: 0,
-                    properties: device.properties.to_owned(),
+                    family: 1,
+                    properties: device.get_ls_props(),
                 };
                 devices.push(d);
             }
             let reply = GetDevicesResponse { devices };
+            println!(
+                "Returning devices status took {} ns",
+                now.elapsed().as_nanos()
+            );
             Ok(Response::new(reply))
         }
     }
