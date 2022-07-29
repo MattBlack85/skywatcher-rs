@@ -16,7 +16,7 @@ tonic = "0.7"
 tonic-reflection = "0.4"
 tokio = { version = "1", features = ["rt-multi-thread"] }
 tokio-serial = "5.4"
-universe = { git = "https://github.com/MattBlack85/libuniverse", branch = "main" }
+runiverse = "0"
 
 [dependencies.uuid]
 version = "1"

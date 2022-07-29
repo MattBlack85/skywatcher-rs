@@ -12,12 +12,13 @@ use serialport::{available_ports, SerialPortType, UsbPortInfo};
 use skywatcher_rs::{
     degrees_to_precise_revolutions, degrees_to_revolutions, str_24bits_to_u32, TrackingMode,
 };
+use skywatcher_rs::{precise_revolutions_to_degrees, str_to_u32};
 use std::fmt::UpperHex;
 use std::io::{Read, Write};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
-use universe::transform::{dec_to_deg, ra_to_deg};
-use universe::{Declination, RightAscension};
+use runiverse::transform::{dec_to_deg, ra_to_deg};
+use runiverse::{Declination, RightAscension};
 use uuid::Uuid;
 
 const TRACKING_OFF: &str = "Off";
@@ -67,19 +68,92 @@ pub struct MountDevice {
     static_properties: Vec<Property>,
     address: String,
     pub baud: u32,
-    #[cfg(unix)]
+    #[cfg(all(unix, not(test)))]
     pub port: TTYPort,
-    #[cfg(windows)]
+    #[cfg(all(windows, not(test)))]
     pub port: COMPort,
+    #[cfg(test)]
+    pub port: MockableSerial,
     track_mode: Arc<RwLock<String>>,
     aligned: Arc<RwLock<String>>,
 }
 
-impl AstroSerialDevice for MountDevice {
-    fn new(name: &str, address: &str, baud: u32, timeout_ms: u64) -> Option<Self> {
-        let builder = serialport::new(address, baud).timeout(Duration::from_millis(timeout_ms));
+use std::io::{Error, ErrorKind};
 
-        if let Ok(port_) = builder.open_native() {
+pub struct MockableSerial {
+    next_success: bool,
+    next_response: Vec<u8>,
+    last_read: usize
+}
+
+impl MockableSerial {
+    fn new(address: &str, baud: u32) -> Self {
+        Self {
+            next_success: true,
+            next_response: vec!(0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x23),
+	    last_read: 0
+        }
+    }
+
+    fn open_native(&self) -> Result<Self, std::io::Error> {
+        Ok(
+	    Self {
+		next_success: true,
+		next_response: vec!(0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x23),
+		last_read: 0
+            }
+	)
+    }
+
+    fn write(&self, _b: &Vec<u8>) -> Result<(), std::io::Error> {
+        Ok(())
+    }
+
+    fn read(&mut self, buff: &mut [u8]) -> Result<(), std::io::Error> {
+        let v = *self.next_response.get(self.last_read).unwrap();
+	buff[0] = v;
+
+	debug!("Index is at: {}", self.last_read);
+	if v == 0x23 {
+	    self.last_read = 0;
+	} else {
+	    self.last_read += 1;
+	}
+	debug!("After Index is at: {}", self.last_read);
+
+        if self.next_success {
+            return Ok(());
+        } else {
+            return Err(Error::new(ErrorKind::Other, "An error"));
+        };
+    }
+}
+
+pub struct SerialType<T> {
+    pub st: T
+}
+
+#[cfg(test)]
+fn get_serial_port(address: &str, baud: u32, timeout_ms: u64) -> SerialType<MockableSerial> {
+    SerialType { st: MockableSerial::new("/dev/abc", 9600) }
+}
+
+#[cfg(not(test))]
+fn get_serial_port(address: &str, baud: u32, timeout_ms: u64) -> SerialType<serialport::SerialPortBuilder> {
+    SerialType { st: serialport::new(address, baud).timeout(Duration::from_millis(timeout_ms)) }
+}
+
+impl AstroSerialDevice for MountDevice {
+    
+    
+    fn new(name: &str, address: &str, baud: u32, timeout_ms: u64) -> Option<Self> {
+	#[cfg(not(test))]
+	let builder: SerialType<serialport::SerialPortBuilder> = get_serial_port(address, baud, timeout_ms);
+
+	#[cfg(test)]
+	let builder: SerialType<MockableSerial> = get_serial_port(address, baud, timeout_ms);
+
+        if let Ok(port_) = builder.st.open_native() {
             let mut dev = Self {
                 id: Uuid::new_v4(),
                 name: name.to_owned(),
@@ -109,6 +183,7 @@ impl AstroSerialDevice for MountDevice {
     fn fetch_props(&mut self) {
         info!("Fetching actual state");
         self.get_tracking_mode();
+        self.get_precise_ra_dec_position();
     }
 
     fn get_id(&self) -> Uuid {
@@ -154,10 +229,11 @@ impl AstroSerialDevice for MountDevice {
                     match self.port.read(read_buf.as_mut_slice()) {
                         Ok(_) => {
                             let byte = read_buf[0];
-                            //debug!("Read byte: {}", byte);
+                            println!("Read byte: {}", byte);
                             final_buf.push(byte);
 
                             if byte == 0x23 as u8 {
+				println!("Breaking");
                                 break;
                             }
                         }
@@ -287,7 +363,23 @@ impl SynScanMount for MountDevice {
 
     fn get_precise_ra_dec_position(&mut self) -> String {
         match self.send_command(Command::GetPreciseRaDec as i32, None) {
-            Ok(p) => p,
+            Ok(p) => {
+                let ra_rev = (&p[0..6]).to_string();
+                let dec_rev = (&p[9..15]).to_string();
+                info!("RA rev,DEC rev: {} {}", &ra_rev, &dec_rev);
+                let ra_rev_s = str_to_u32(ra_rev).unwrap();
+                let dec_rev_s = str_to_u32(dec_rev).unwrap();
+                info!(
+                    "RA rev integer,DEC rev integer: {} {}",
+                    &ra_rev_s, &dec_rev_s
+                );
+                let ra = precise_revolutions_to_degrees(ra_rev_s);
+                let dec = precise_revolutions_to_degrees(dec_rev_s);
+                info!("RA degrees,DEC degrees: {} {}", &ra, &dec);
+		let real_dec = Declination::from_degrees(dec as f64);
+		info!("Dec: {}", real_dec);
+                p
+            }
             Err(_) => String::from("UNKNOWN"),
         }
     }
@@ -528,4 +620,18 @@ pub fn look_for_devices() -> Vec<(String, UsbPortInfo)> {
     }
 
     devices
+}
+
+#[cfg(test)]
+mod test {
+    use astrotools::AstroSerialDevice;
+    use crate::MountDevice;
+    use env_logger::Env;
+
+    #[test]
+    fn test_new() {
+	let env = Env::default().filter_or("LS_LOG_LEVEL", "info");
+	env_logger::init_from_env(env);	
+	let m = MountDevice::new("lol", "/abc", 9120, 1000);
+    }
 }

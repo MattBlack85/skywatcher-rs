@@ -200,11 +200,14 @@ impl EQModMount for MountDevice {
 
     /// Returns the motor board version.
     fn get_motor_board_version(&mut self) -> u32 {
-        let version = match self.send_command(RaCommand::MotorBoardVersion as i32, None) {
+        if let Some(version) = match self.send_command(RaCommand::MotorBoardVersion as i32, None) {
             Ok(v) => str_24bits_to_u32(v),
-            Err(_) => 0x0,
-        };
-        version
+            Err(_) => Some(0x0),
+        } {
+            version
+	} else {
+	    0
+	}
     }
 
     /// Returns (RA grid, DEC grid) grids per revolution.
